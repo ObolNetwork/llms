@@ -6,6 +6,10 @@ All routing parameters: keyword lists, dimension weights, tier boundaries,
 confidence calibration, and tier-to-model preferences.
 """
 
+from copy import deepcopy
+
+TIERS = ("SIMPLE", "MEDIUM", "COMPLEX", "REASONING")
+
 DEFAULT_SCORING_CONFIG = {
     "tokenCountThresholds": {"simple": 50, "complex": 500},
 
@@ -232,3 +236,14 @@ TIER_COST_THRESHOLDS = {
     "COMPLEX": 20.0,
     "REASONING": 50.0,
 }
+
+DEFAULT_CONFIG = {
+    "scoring": DEFAULT_SCORING_CONFIG,
+    "overrides": DEFAULT_OVERRIDES,
+    "tierPreferences": DEFAULT_TIER_PREFERENCES,
+    "agenticPreferences": DEFAULT_AGENTIC_PREFERENCES,
+}
+
+
+def default_config():
+    return deepcopy(DEFAULT_CONFIG)

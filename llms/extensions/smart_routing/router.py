@@ -1,55 +1,79 @@
 """
-Tier-to-Provider Mapping
-
-Maps scoring tiers to llmspy's dynamically active providers.
-Uses preferred model lists, capability filtering, and cost-based fallback.
+Tier-to-provider ranking and selection.
 """
 
-import re
+from __future__ import annotations
+
+import math
+from typing import Any, Dict, List, Optional, Tuple
 
 from .config import (
     DEFAULT_AGENTIC_PREFERENCES,
     DEFAULT_TIER_PREFERENCES,
     TIER_COST_THRESHOLDS,
-    TIER_RANK,
 )
 
-
-def select_provider(tier, agentic, providers, preferences=None, agentic_preferences=None):
-    """
-    Select the best provider and model for a given tier.
-
-    Args:
-        tier: "SIMPLE"|"MEDIUM"|"COMPLEX"|"REASONING"
-        agentic: Whether to use agentic tier preferences
-        providers: dict of {provider_id: provider_instance} from ctx.get_providers()
-        preferences: Optional override for tier preferences
-        agentic_preferences: Optional override for agentic preferences
-
-    Returns:
-        (provider_id, model_id, model_info) or None if no provider found
-    """
-    prefs = agentic_preferences or DEFAULT_AGENTIC_PREFERENCES if agentic else preferences or DEFAULT_TIER_PREFERENCES
-    tier_pref = prefs.get(tier)
-    if not tier_pref:
-        return None
-
-    required_caps = tier_pref.get("capabilities", {})
-
-    # Try each preferred model in order
-    for preferred_model in tier_pref["preferred_models"]:
-        result = _find_provider_for_model(preferred_model, providers, required_caps)
-        if result:
-            return result
-
-    # Fallback: find cheapest available model matching tier cost threshold
-    return _fallback_by_cost(tier, providers, required_caps)
+Candidate = Tuple[str, str, Dict[str, Any]]
 
 
-def _find_provider_for_model(model_name, providers, required_caps):
-    """Find an active provider that supports the given model name."""
+def select_provider(
+    tier: str,
+    agentic: bool,
+    providers: Dict[str, Any],
+    preferences: Optional[Dict[str, Any]] = None,
+    agentic_preferences: Optional[Dict[str, Any]] = None,
+) -> Optional[Candidate]:
+    ranked = rank_candidates(
+        tier,
+        agentic,
+        providers,
+        preferences=preferences,
+        agentic_preferences=agentic_preferences,
+    )
+    return ranked[0] if ranked else None
+
+
+def rank_candidates(
+    tier: str,
+    agentic: bool,
+    providers: Dict[str, Any],
+    preferences: Optional[Dict[str, Any]] = None,
+    agentic_preferences: Optional[Dict[str, Any]] = None,
+) -> List[Candidate]:
+    prefs = _tier_preferences(agentic, preferences, agentic_preferences)
+    tier_pref = prefs.get(tier) or {}
+    required_caps = tier_pref.get("capabilities", {}) if isinstance(tier_pref, dict) else {}
+    preferred_models = tier_pref.get("preferred_models", []) if isinstance(tier_pref, dict) else []
+
+    candidates: List[Candidate] = []
+
+    for preferred_model in preferred_models:
+        candidates.extend(_find_provider_candidates_for_model(str(preferred_model), providers, required_caps))
+
+    candidates.extend(_fallback_by_cost_candidates(tier, providers, required_caps))
+    if not candidates:
+        candidates.extend(_any_available_models(providers))
+
+    return _dedupe_candidates(candidates)
+
+
+def _tier_preferences(
+    agentic: bool,
+    preferences: Optional[Dict[str, Any]],
+    agentic_preferences: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    if agentic:
+        return agentic_preferences or DEFAULT_AGENTIC_PREFERENCES
+    return preferences or DEFAULT_TIER_PREFERENCES
+
+
+def _find_provider_candidates_for_model(
+    model_name: str,
+    providers: Dict[str, Any],
+    required_caps: Dict[str, Any],
+) -> List[Candidate]:
+    ranked: List[Tuple[float, Candidate]] = []
     for provider_id, provider in providers.items():
-        # Skip the smart_routing provider itself
         if provider_id == "smart_routing":
             continue
 
@@ -57,53 +81,96 @@ def _find_provider_for_model(model_name, providers, required_caps):
         if not resolved:
             continue
 
-        # Check capabilities
-        info = provider.model_info(model_name)
-        if info and _meets_capabilities(info, required_caps):
-            return provider_id, resolved, info
+        info = _model_info(provider, model_name, resolved)
+        if not info or not _meets_capabilities(info, required_caps):
+            continue
+        ranked.append((_input_cost(info), (provider_id, resolved, info)))
 
-    return None
+    ranked.sort(key=lambda item: item[0])
+    return [candidate for _cost, candidate in ranked]
 
 
-def _meets_capabilities(model_info, required_caps):
-    """Check if a model meets required capabilities."""
-    for cap, required in required_caps.items():
-        if required and not model_info.get(cap):
+def _meets_capabilities(model_info: Dict[str, Any], required_caps: Dict[str, Any]) -> bool:
+    if not isinstance(required_caps, dict):
+        return True
+    for capability, required in required_caps.items():
+        if bool(required) and not bool(model_info.get(capability)):
             return False
     return True
 
 
-def _fallback_by_cost(tier, providers, required_caps):
-    """Find the cheapest model within the tier's cost threshold."""
-    max_cost = TIER_COST_THRESHOLDS.get(tier, 50.0)
-    candidates = []
+def _fallback_by_cost_candidates(
+    tier: str,
+    providers: Dict[str, Any],
+    required_caps: Dict[str, Any],
+) -> List[Candidate]:
+    max_cost = float(TIER_COST_THRESHOLDS.get(tier, 50.0))
+    ranked: List[Tuple[float, Candidate]] = []
 
     for provider_id, provider in providers.items():
         if provider_id == "smart_routing":
             continue
 
-        for model_id, model_info in provider.models.items():
-            cost = model_info.get("cost", {})
-            input_cost = cost.get("input", 0) if isinstance(cost, dict) else 0
+        models = getattr(provider, "models", {}) or {}
+        for model_id, model_info in models.items():
+            if not isinstance(model_info, dict):
+                continue
+            if not _meets_capabilities(model_info, required_caps):
+                continue
+            input_cost = _input_cost(model_info)
+            if input_cost <= max_cost:
+                ranked.append((input_cost, (provider_id, str(model_id), model_info)))
 
-            if input_cost <= max_cost and _meets_capabilities(model_info, required_caps):
-                candidates.append((provider_id, model_id, model_info, input_cost))
-
-    if not candidates:
-        # Last resort: return any available model
-        return _any_available_model(providers)
-
-    # Sort by input cost ascending
-    candidates.sort(key=lambda x: x[3])
-    best = candidates[0]
-    return best[0], best[1], best[2]
+    ranked.sort(key=lambda item: item[0])
+    return [candidate for _cost, candidate in ranked]
 
 
-def _any_available_model(providers):
-    """Return any available model as absolute last resort."""
+def _any_available_models(providers: Dict[str, Any]) -> List[Candidate]:
+    ret: List[Candidate] = []
     for provider_id, provider in providers.items():
         if provider_id == "smart_routing":
             continue
-        for model_id, model_info in provider.models.items():
-            return provider_id, model_id, model_info
+        models = getattr(provider, "models", {}) or {}
+        for model_id, model_info in models.items():
+            if isinstance(model_info, dict):
+                ret.append((provider_id, str(model_id), model_info))
+    return ret
+
+
+def _input_cost(model_info: Dict[str, Any]) -> float:
+    cost = model_info.get("cost", {})
+    if not isinstance(cost, dict):
+        return math.inf
+    input_cost = cost.get("input")
+    try:
+        if input_cost is None:
+            return math.inf
+        return float(input_cost)
+    except (TypeError, ValueError):
+        return math.inf
+
+
+def _model_info(provider: Any, requested_model: str, resolved_model: str) -> Optional[Dict[str, Any]]:
+    info = provider.model_info(requested_model)
+    if isinstance(info, dict):
+        return info
+    info = provider.model_info(resolved_model)
+    if isinstance(info, dict):
+        return info
+    models = getattr(provider, "models", {}) or {}
+    direct = models.get(resolved_model)
+    if isinstance(direct, dict):
+        return direct
     return None
+
+
+def _dedupe_candidates(candidates: List[Candidate]) -> List[Candidate]:
+    seen = set()
+    deduped: List[Candidate] = []
+    for candidate in candidates:
+        key = (candidate[0], candidate[1])
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(candidate)
+    return deduped

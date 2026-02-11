@@ -1,177 +1,203 @@
 """
-14-Dimension Weighted Scoring Classifier
-
-Ported from ClawRouter's router/rules.ts.
-Scores a request across 14 weighted dimensions and maps the aggregate
-score to a tier using configurable boundaries. Confidence is calibrated
-via sigmoid.
+14-dimension weighted scoring classifier.
 """
+
+from __future__ import annotations
 
 import math
 import re
 from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
 
 
 @dataclass
 class ScoringResult:
     score: float
-    tier: str | None  # "SIMPLE"|"MEDIUM"|"COMPLEX"|"REASONING"|None (ambiguous)
+    tier: Optional[str]
     confidence: float
-    signals: list[str] = field(default_factory=list)
+    signals: List[str] = field(default_factory=list)
     agentic_score: float = 0.0
 
 
-def _score_token_count(estimated_tokens, thresholds):
-    if estimated_tokens < thresholds["simple"]:
-        return "tokenCount", -1.0, f"short ({estimated_tokens} tokens)"
-    if estimated_tokens > thresholds["complex"]:
-        return "tokenCount", 1.0, f"long ({estimated_tokens} tokens)"
+DimensionScore = Tuple[str, float, Optional[str]]
+
+
+def _score_token_count(estimated_tokens: int, thresholds: Dict[str, Any]) -> DimensionScore:
+    simple_threshold = int(thresholds.get("simple", 50))
+    complex_threshold = int(thresholds.get("complex", 500))
+    if estimated_tokens < simple_threshold:
+        return "tokenCount", -1.0, "short (%d tokens)" % estimated_tokens
+    if estimated_tokens > complex_threshold:
+        return "tokenCount", 1.0, "long (%d tokens)" % estimated_tokens
     return "tokenCount", 0.0, None
 
 
-def _score_keyword_match(text, keywords, name, signal_label, thresholds, scores):
+def _score_keyword_match(
+    text: str,
+    keywords: List[str],
+    name: str,
+    signal_label: str,
+    thresholds: Dict[str, int],
+    scores: Dict[str, float],
+) -> DimensionScore:
     matches = [kw for kw in keywords if kw.lower() in text]
-    if len(matches) >= thresholds["high"]:
-        return name, scores["high"], f"{signal_label} ({', '.join(matches[:3])})"
-    if len(matches) >= thresholds["low"]:
-        return name, scores["low"], f"{signal_label} ({', '.join(matches[:3])})"
-    return name, scores["none"], None
+    if len(matches) >= int(thresholds.get("high", 2)):
+        return name, float(scores.get("high", 0.0)), "%s (%s)" % (signal_label, ", ".join(matches[:3]))
+    if len(matches) >= int(thresholds.get("low", 1)):
+        return name, float(scores.get("low", 0.0)), "%s (%s)" % (signal_label, ", ".join(matches[:3]))
+    return name, float(scores.get("none", 0.0)), None
 
 
-def _score_multi_step(text):
+def _score_multi_step(text: str) -> DimensionScore:
     patterns = [r"first.*then", r"step \d", r"\d\.\s"]
-    hits = [p for p in patterns if re.search(p, text, re.IGNORECASE)]
-    if hits:
-        return "multiStepPatterns", 0.5, "multi-step"
+    for pattern in patterns:
+        if re.search(pattern, text, re.IGNORECASE):
+            return "multiStepPatterns", 0.5, "multi-step"
     return "multiStepPatterns", 0.0, None
 
 
-def _score_question_complexity(prompt):
+def _score_question_complexity(prompt: str) -> DimensionScore:
     count = prompt.count("?")
     if count > 3:
-        return "questionComplexity", 0.5, f"{count} questions"
+        return "questionComplexity", 0.5, "%d questions" % count
     return "questionComplexity", 0.0, None
 
 
-def _score_agentic_task(text, keywords):
+def _score_agentic_task(text: str, keywords: List[str]) -> Tuple[DimensionScore, float]:
     match_count = 0
     signals = []
-    for kw in keywords:
-        if kw.lower() in text:
+    for keyword in keywords:
+        if keyword.lower() in text:
             match_count += 1
             if len(signals) < 3:
-                signals.append(kw)
+                signals.append(keyword)
 
     if match_count >= 4:
-        return ("agenticTask", 1.0, f"agentic ({', '.join(signals)})"), 1.0
+        return ("agenticTask", 1.0, "agentic (%s)" % ", ".join(signals)), 1.0
     if match_count >= 3:
-        return ("agenticTask", 0.6, f"agentic ({', '.join(signals)})"), 0.6
+        return ("agenticTask", 0.6, "agentic (%s)" % ", ".join(signals)), 0.6
     if match_count >= 1:
-        return ("agenticTask", 0.2, f"agentic-light ({', '.join(signals)})"), 0.2
+        return ("agenticTask", 0.2, "agentic-light (%s)" % ", ".join(signals)), 0.2
     return ("agenticTask", 0.0, None), 0.0
 
 
-def _calibrate_confidence(distance, steepness):
+def _calibrate_confidence(distance: float, steepness: float) -> float:
     return 1.0 / (1.0 + math.exp(-steepness * distance))
 
 
-def classify(prompt, system_prompt, estimated_tokens, config):
-    """
-    Classify a prompt into a complexity tier.
+def classify(prompt: str, system_prompt: Optional[str], estimated_tokens: int, config: Dict[str, Any]) -> ScoringResult:
+    text = ("%s %s" % (system_prompt or "", prompt or "")).lower()
+    user_text = (prompt or "").lower()
 
-    Args:
-        prompt: The user's prompt text
-        system_prompt: Optional system prompt (or None)
-        estimated_tokens: Estimated token count for the full text
-        config: Scoring config dict (DEFAULT_SCORING_CONFIG)
-
-    Returns:
-        ScoringResult with tier, confidence, signals, and agentic_score
-    """
-    text = f"{system_prompt or ''} {prompt}".lower()
-    user_text = prompt.lower()
-
-    # Score all 14 dimensions
     dimensions = [
-        _score_token_count(estimated_tokens, config["tokenCountThresholds"]),
+        _score_token_count(estimated_tokens, config.get("tokenCountThresholds", {})),
         _score_keyword_match(
-            text, config["codeKeywords"],
-            "codePresence", "code",
-            {"low": 1, "high": 2}, {"none": 0, "low": 0.5, "high": 1.0},
-        ),
-        # Reasoning markers: user prompt only
-        _score_keyword_match(
-            user_text, config["reasoningKeywords"],
-            "reasoningMarkers", "reasoning",
-            {"low": 1, "high": 2}, {"none": 0, "low": 0.7, "high": 1.0},
+            text,
+            config.get("codeKeywords", []),
+            "codePresence",
+            "code",
+            {"low": 1, "high": 2},
+            {"none": 0, "low": 0.5, "high": 1.0},
         ),
         _score_keyword_match(
-            text, config["technicalKeywords"],
-            "technicalTerms", "technical",
-            {"low": 2, "high": 4}, {"none": 0, "low": 0.5, "high": 1.0},
+            user_text,
+            config.get("reasoningKeywords", []),
+            "reasoningMarkers",
+            "reasoning",
+            {"low": 1, "high": 2},
+            {"none": 0, "low": 0.7, "high": 1.0},
         ),
         _score_keyword_match(
-            text, config["creativeKeywords"],
-            "creativeMarkers", "creative",
-            {"low": 1, "high": 2}, {"none": 0, "low": 0.5, "high": 0.7},
+            text,
+            config.get("technicalKeywords", []),
+            "technicalTerms",
+            "technical",
+            {"low": 2, "high": 4},
+            {"none": 0, "low": 0.5, "high": 1.0},
         ),
         _score_keyword_match(
-            text, config["simpleKeywords"],
-            "simpleIndicators", "simple",
-            {"low": 1, "high": 2}, {"none": 0, "low": -1.0, "high": -1.0},
+            text,
+            config.get("creativeKeywords", []),
+            "creativeMarkers",
+            "creative",
+            {"low": 1, "high": 2},
+            {"none": 0, "low": 0.5, "high": 0.7},
+        ),
+        _score_keyword_match(
+            text,
+            config.get("simpleKeywords", []),
+            "simpleIndicators",
+            "simple",
+            {"low": 1, "high": 2},
+            {"none": 0, "low": -1.0, "high": -1.0},
         ),
         _score_multi_step(text),
-        _score_question_complexity(prompt),
+        _score_question_complexity(prompt or ""),
         _score_keyword_match(
-            text, config["imperativeVerbs"],
-            "imperativeVerbs", "imperative",
-            {"low": 1, "high": 2}, {"none": 0, "low": 0.3, "high": 0.5},
+            text,
+            config.get("imperativeVerbs", []),
+            "imperativeVerbs",
+            "imperative",
+            {"low": 1, "high": 2},
+            {"none": 0, "low": 0.3, "high": 0.5},
         ),
         _score_keyword_match(
-            text, config["constraintIndicators"],
-            "constraintCount", "constraints",
-            {"low": 1, "high": 3}, {"none": 0, "low": 0.3, "high": 0.7},
+            text,
+            config.get("constraintIndicators", []),
+            "constraintCount",
+            "constraints",
+            {"low": 1, "high": 3},
+            {"none": 0, "low": 0.3, "high": 0.7},
         ),
         _score_keyword_match(
-            text, config["outputFormatKeywords"],
-            "outputFormat", "format",
-            {"low": 1, "high": 2}, {"none": 0, "low": 0.4, "high": 0.7},
+            text,
+            config.get("outputFormatKeywords", []),
+            "outputFormat",
+            "format",
+            {"low": 1, "high": 2},
+            {"none": 0, "low": 0.4, "high": 0.7},
         ),
         _score_keyword_match(
-            text, config["referenceKeywords"],
-            "referenceComplexity", "references",
-            {"low": 1, "high": 2}, {"none": 0, "low": 0.3, "high": 0.5},
+            text,
+            config.get("referenceKeywords", []),
+            "referenceComplexity",
+            "references",
+            {"low": 1, "high": 2},
+            {"none": 0, "low": 0.3, "high": 0.5},
         ),
         _score_keyword_match(
-            text, config["negationKeywords"],
-            "negationComplexity", "negation",
-            {"low": 2, "high": 3}, {"none": 0, "low": 0.3, "high": 0.5},
+            text,
+            config.get("negationKeywords", []),
+            "negationComplexity",
+            "negation",
+            {"low": 2, "high": 3},
+            {"none": 0, "low": 0.3, "high": 0.5},
         ),
         _score_keyword_match(
-            text, config["domainSpecificKeywords"],
-            "domainSpecificity", "domain-specific",
-            {"low": 1, "high": 2}, {"none": 0, "low": 0.5, "high": 0.8},
+            text,
+            config.get("domainSpecificKeywords", []),
+            "domainSpecificity",
+            "domain-specific",
+            {"low": 1, "high": 2},
+            {"none": 0, "low": 0.5, "high": 0.8},
         ),
     ]
 
-    # Score agentic task indicators
-    agentic_dim, agentic_score = _score_agentic_task(text, config["agenticTaskKeywords"])
+    agentic_dim, agentic_score = _score_agentic_task(text, config.get("agenticTaskKeywords", []))
     dimensions.append(agentic_dim)
 
-    # Collect signals
-    signals = [sig for _, _, sig in dimensions if sig is not None]
+    signals = [signal for _, _, signal in dimensions if signal]
 
-    # Compute weighted score
-    weights = config["dimensionWeights"]
+    weights = config.get("dimensionWeights", {})
     weighted_score = 0.0
-    for name, score, _ in dimensions:
-        w = weights.get(name, 0)
-        weighted_score += score * w
+    for name, score, _signal in dimensions:
+        weighted_score += float(score) * float(weights.get(name, 0.0))
 
-    # Reasoning override: 2+ reasoning markers in user prompt → force REASONING
-    reasoning_matches = [kw for kw in config["reasoningKeywords"] if kw.lower() in user_text]
+    reasoning_matches = [kw for kw in config.get("reasoningKeywords", []) if kw.lower() in user_text]
+    steepness = float(config.get("confidenceSteepness", 12))
+
     if len(reasoning_matches) >= 2:
-        confidence = _calibrate_confidence(max(weighted_score, 0.3), config["confidenceSteepness"])
+        confidence = _calibrate_confidence(max(weighted_score, 0.3), steepness)
         return ScoringResult(
             score=weighted_score,
             tier="REASONING",
@@ -180,11 +206,10 @@ def classify(prompt, system_prompt, estimated_tokens, config):
             agentic_score=agentic_score,
         )
 
-    # Map weighted score to tier using boundaries
-    boundaries = config["tierBoundaries"]
-    simple_medium = boundaries["simpleMedium"]
-    medium_complex = boundaries["mediumComplex"]
-    complex_reasoning = boundaries["complexReasoning"]
+    boundaries = config.get("tierBoundaries", {})
+    simple_medium = float(boundaries.get("simpleMedium", 0.0))
+    medium_complex = float(boundaries.get("mediumComplex", 0.18))
+    complex_reasoning = float(boundaries.get("complexReasoning", 0.4))
 
     if weighted_score < simple_medium:
         tier = "SIMPLE"
@@ -199,11 +224,9 @@ def classify(prompt, system_prompt, estimated_tokens, config):
         tier = "REASONING"
         distance = weighted_score - complex_reasoning
 
-    # Calibrate confidence via sigmoid
-    confidence = _calibrate_confidence(distance, config["confidenceSteepness"])
-
-    # Below threshold → ambiguous
-    if confidence < config["confidenceThreshold"]:
+    confidence = _calibrate_confidence(distance, steepness)
+    threshold = float(config.get("confidenceThreshold", 0.7))
+    if confidence < threshold:
         return ScoringResult(
             score=weighted_score,
             tier=None,
