@@ -544,8 +544,15 @@ def read_binary_file(url):
 async def process_chat(chat, provider_id=None):
     if not chat:
         raise Exception("No chat provided")
-    if "stream" not in chat:
-        chat["stream"] = False
+    # WORKAROUND: Force stream=false for all provider requests.
+    # chat_handler() (the /v1/chat/completions endpoint) does not natively support
+    # streaming — it always collects the full response and returns JSON. If a client
+    # sends stream=true and we pass it through, the upstream provider (e.g. Ollama)
+    # returns SSE (text/event-stream), which response_json() cannot parse as JSON,
+    # causing "Expecting value: line 1 column 1 (char 0)" errors and HTTP 500s.
+    # Instead we force non-streaming here, and chat_handler converts the JSON response
+    # back to SSE chunks if the client originally requested streaming.
+    chat["stream"] = False
     # Some providers don't support empty tools
     if "tools" in chat and (chat["tools"] is None or len(chat["tools"]) == 0):
         del chat["tools"]
@@ -4127,11 +4134,43 @@ def cli_exec(cli_args, extra_args):
 
             try:
                 chat = await request.json()
+                # Remember whether the client requested streaming before process_chat
+                # forces it to False (see WORKAROUND in process_chat).
+                client_wants_stream = chat.get("stream", False)
                 context = {"chat": chat, "request": request, "user": g_app.get_username(request)}
                 metadata = chat.get("metadata", {})
                 context["threadId"] = metadata.get("threadId", None)
                 context["tools"] = metadata.get("tools", "all")
                 response = await g_app.chat_completion(chat, context)
+                if client_wants_stream:
+                    # WORKAROUND: Convert the non-streaming JSON response to SSE chunks.
+                    # Clients like the Vercel AI SDK (@ai-sdk/openai-compatible) send
+                    # stream=true and parse the response as Server-Sent Events with
+                    # "chat.completion.chunk" objects containing a "delta" field.
+                    # Since process_chat forces stream=false and we always get back a
+                    # regular "chat.completion" JSON object, we re-wrap it here as a
+                    # single SSE chunk so streaming clients can parse it correctly.
+                    sse_response = web.StreamResponse(
+                        status=200,
+                        headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"},
+                    )
+                    await sse_response.prepare(request)
+                    for choice in response.get("choices", []):
+                        chunk = {
+                            "id": response.get("id", ""),
+                            "object": "chat.completion.chunk",
+                            "created": response.get("created", 0),
+                            "model": response.get("model", ""),
+                            "choices": [{
+                                "index": choice.get("index", 0),
+                                "delta": {"role": "assistant", "content": choice.get("message", {}).get("content", "")},
+                                "finish_reason": choice.get("finish_reason"),
+                            }],
+                            "usage": response.get("usage"),
+                        }
+                        await sse_response.write(f"data: {json.dumps(chunk)}\n\n".encode())
+                    await sse_response.write(b"data: [DONE]\n\n")
+                    return sse_response
                 return web.json_response(response)
             except Exception as e:
                 return web.json_response(to_error_response(e), status=500)
