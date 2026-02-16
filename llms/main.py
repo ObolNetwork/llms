@@ -57,7 +57,7 @@ except ImportError:
     HAS_PIL = False
 
 _ROOT = None
-VERSION = "3.0.32"
+VERSION = "3.0.33"
 DEBUG = os.getenv("DEBUG") == "1"
 MOCK = os.getenv("MOCK") == "1"
 MOCK_DIR = os.getenv("MOCK_DIR")
@@ -1991,7 +1991,9 @@ async def g_chat_completion(chat, context=None):
     raise e
 
 
-async def cli_chat(chat, tools=None, image=None, audio=None, file=None, args=None, raw=False):
+async def cli_chat(
+    chat, tools=None, image=None, audio=None, file=None, args=None, raw=False, nohistory=False, nostore=False
+):
     if g_default_model:
         chat["model"] = g_default_model
 
@@ -2068,6 +2070,8 @@ async def cli_chat(chat, tools=None, image=None, audio=None, file=None, args=Non
     try:
         context = {
             "tools": tools or "all",
+            "nohistory": nohistory or nostore,
+            "nostore": nostore,
         }
         response = await g_app.chat_completion(chat, context=context)
 
@@ -3080,6 +3084,9 @@ class AppExtensions:
     def create_chat_with_tools(self, chat: Dict[str, Any], use_tools: str = "all") -> Dict[str, Any]:
         # Inject global tools if present
         current_chat = chat.copy()
+        # Don't inject tools when response_format is set (structured output)
+        if "response_format" in current_chat:
+            return current_chat
         tools = current_chat.get("tools")
         if tools is None:
             tools = current_chat["tools"] = []
@@ -3739,6 +3746,8 @@ def create_arg_parser():
         metavar="PARAMS",
     )
     parser.add_argument("--raw", action="store_true", help="Return raw AI JSON response")
+    parser.add_argument("--nohistory", action="store_true", help="Skip saving chat thread history to database")
+    parser.add_argument("--nostore", action="store_true", help="Do not save request or chat thread to database")
 
     parser.add_argument(
         "--list", action="store_true", help="Show list of enabled providers and their models (alias ls provider?)"
@@ -4141,6 +4150,9 @@ def cli_exec(cli_args, extra_args):
                 metadata = chat.get("metadata", {})
                 context["threadId"] = metadata.get("threadId", None)
                 context["tools"] = metadata.get("tools", "all")
+                nostore = metadata.get("nostore", False)
+                context["nohistory"] = metadata.get("nohistory", False) or nostore
+                context["nostore"] = nostore
                 response = await g_app.chat_completion(chat, context)
                 if client_wants_stream:
                     # WORKAROUND: Convert the non-streaming JSON response to SSE chunks.
@@ -4580,8 +4592,20 @@ def cli_exec(cli_args, extra_args):
         print(f"\nDefault model set to: {default_model}")
         return ExitCode.SUCCESS
 
+    # Read chat template from stdin if data is piped (e.g. cat template.json | llms)
+    stdin_chat = None
+    if not sys.stdin.isatty():
+        stdin_data = sys.stdin.read().strip()
+        if stdin_data:
+            try:
+                stdin_chat = json.loads(stdin_data)
+            except json.JSONDecodeError:
+                print(f"Invalid JSON from stdin")
+                return ExitCode.FAILED
+
     if (
         cli_args.chat is not None
+        or stdin_chat is not None
         or cli_args.image is not None
         or cli_args.audio is not None
         or cli_args.file is not None
@@ -4603,7 +4627,7 @@ def cli_exec(cli_args, extra_args):
                     return ExitCode.FAILED
                 chat = g_config["defaults"][template]
             if cli_args.chat is not None:
-                chat_path = os.path.join(os.path.dirname(__file__), cli_args.chat)
+                chat_path = os.path.abspath(cli_args.chat)
                 if not os.path.exists(chat_path):
                     print(f"Chat request template not found: {chat_path}")
                     return ExitCode.FAILED
@@ -4612,6 +4636,9 @@ def cli_exec(cli_args, extra_args):
                 with open(chat_path) as f:
                     chat_json = f.read()
                     chat = json.loads(chat_json)
+            elif stdin_chat is not None:
+                _log(f"Using chat from stdin")
+                chat = stdin_chat
 
             if cli_args.system is not None:
                 chat["messages"].insert(0, {"role": "system", "content": cli_args.system})
@@ -4645,6 +4672,8 @@ def cli_exec(cli_args, extra_args):
                     file=cli_args.file,
                     args=args,
                     raw=cli_args.raw,
+                    nohistory=cli_args.nohistory,
+                    nostore=cli_args.nostore,
                 )
             )
             return ExitCode.SUCCESS

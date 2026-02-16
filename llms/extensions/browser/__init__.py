@@ -44,18 +44,24 @@ def install(ctx):
     def _add_debug_log(cmd_str, result, duration):
         global DEBUG_LOG_COUNTER
         DEBUG_LOG_COUNTER += 1
+        stdout = result.get("stdout", "")
+        stderr = result.get("stderr", result.get("error", ""))
+        rc = result.get("returncode", -1)
         DEBUG_LOG.append(
             {
                 "id": DEBUG_LOG_COUNTER,
                 "ts": time.time(),
                 "cmd": cmd_str,
-                "rc": result.get("returncode", -1),
-                "stdout": result.get("stdout", ""),
-                "stderr": result.get("stderr", result.get("error", "")),
+                "rc": rc,
+                "stdout": stdout,
+                "stderr": stderr,
                 "ok": result.get("success", False),
                 "ms": round(duration * 1000),
             }
         )
+        ctx.dbg(f"{cmd_str}\n{stdout}")
+        if stderr.strip() if stderr else False:
+            ctx.dbg(f"{rc}: {stderr}")
 
     async def run_browser_cmd_async(*args, timeout=30, env=None, record=True):
         """Run agent-browser command asynchronously."""
@@ -155,8 +161,11 @@ def install(ctx):
 
         if success and os.path.exists(screenshot_path):
             return web.FileResponse(screenshot_path, headers={"Content-Type": "image/png", "Cache-Control": "no-cache"})
-        
-        return web.FileResponse(os.path.join(os.path.dirname(__file__), "ui", "connecting.svg"), headers={"Content-Type": "image/svg", "Cache-Control": "no-cache"})
+
+        return web.FileResponse(
+            os.path.join(os.path.dirname(__file__), "ui", "connecting.svg"),
+            headers={"Content-Type": "image/svg+xml", "Cache-Control": "no-cache"},
+        )
 
     ctx.add_get("/browser/screenshot", get_screenshot)
 
@@ -439,18 +448,32 @@ def install(ctx):
             name += ".sh"
         path = os.path.join(get_script_dir(req), os.path.basename(name))
 
-        if not os.path.exists(path):
+        # Check for inline content (e.g. selected text)
+        body = await req.json() if req.content_length else {}
+        inline_content = body.get("content") if body else None
+
+        if not inline_content and not os.path.exists(path):
             return web.json_response({"error": "Script not found"}, status=404)
 
         t0 = time.monotonic()
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "bash",
-                path,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env={**os.environ, "AGENT_BROWSER_SESSION": "default"},
-            )
+            if inline_content:
+                proc = await asyncio.create_subprocess_exec(
+                    "bash",
+                    "-c",
+                    inline_content,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env={**os.environ, "AGENT_BROWSER_SESSION": "default"},
+                )
+            else:
+                proc = await asyncio.create_subprocess_exec(
+                    "bash",
+                    path,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env={**os.environ, "AGENT_BROWSER_SESSION": "default"},
+                )
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
 
             result = {
@@ -515,7 +538,9 @@ def install(ctx):
 
         BROWSER_MODEL = os.getenv("BROWSER_MODEL", ctx.config.get("defaults", {}).get("text", {}).get("model"))
         if not BROWSER_MODEL:
-            raise Exception("No model specified for browser script generation. Set BROWSER_MODEL environment variable or configure a default text model in llms.json.")
+            raise Exception(
+                "No model specified for browser script generation. Set BROWSER_MODEL environment variable or configure a default text model in llms.json."
+            )
         chat_request = {
             "model": BROWSER_MODEL,
             "messages": [
@@ -525,7 +550,7 @@ def install(ctx):
         }
 
         try:
-            response = await ctx.chat_completion(chat_request, context={"tools": "none"})
+            response = await ctx.chat_completion(chat_request, context={"tools": "none", "nohistory":True })
             content = response.get("choices", [{}])[0].get("message", {}).get("content", "")
 
             # Clean up the response - extract just the script
