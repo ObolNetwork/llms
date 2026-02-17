@@ -3,12 +3,9 @@ import os
 import re
 import sqlite3
 import threading
-from datetime import datetime
+import time
 from queue import Empty, Queue
 from threading import Event, Thread
-
-sqlite3.register_adapter(datetime, lambda val: val.isoformat(" "))
-sqlite3.register_converter("timestamp", lambda val: datetime.fromisoformat(val.decode()))
 
 POOL = os.getenv("LLMS_POOL", "0") == "1"
 
@@ -23,8 +20,8 @@ def create_reader_connection(db_path):
 
 
 def create_writer_connection(db_path):
-    conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA busy_timeout=5000")  # Reasonable timeout for busy connections
+    conn = sqlite3.connect(db_path, timeout=10.0)
+    conn.execute("PRAGMA busy_timeout=10000")  # Allow time for concurrent schema init
     conn.execute("PRAGMA journal_mode=WAL")  # Enable WAL mode for better concurrency
     conn.execute("PRAGMA cache_size=-128000")  # Increase cache size for better performance
     conn.execute("PRAGMA synchronous=NORMAL")  # Reasonable durability/performance balance
@@ -32,7 +29,21 @@ def create_writer_connection(db_path):
 
 
 def writer_thread(ctx, db_path, task_queue, stop_event):
-    conn = create_writer_connection(db_path)
+    # Retry connection setup — PRAGMA journal_mode=WAL requires an exclusive
+    # lock which can fail during startup if another thread is still creating
+    # tables on the same database.
+    conn = None
+    for attempt in range(5):
+        try:
+            conn = create_writer_connection(db_path)
+            break
+        except sqlite3.OperationalError as e:
+            if "database is locked" in str(e) and attempt < 4:
+                delay = 0.5 * (2 ** attempt)  # 0.5, 1, 2, 4 seconds
+                ctx.dbg(f"writer_thread: DB locked on startup, retrying in {delay}s (attempt {attempt + 1}/5)")
+                time.sleep(delay)
+            else:
+                raise
     try:
         while not stop_event.is_set():
             try:
