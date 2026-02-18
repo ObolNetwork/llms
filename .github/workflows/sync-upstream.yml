@@ -1,0 +1,212 @@
+name: Sync Upstream
+
+on:
+  pull_request:
+    paths:
+      - 'UPSTREAM_VERSION'
+  push:
+    branches:
+      - main
+    paths:
+      - 'UPSTREAM_VERSION'
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: 'Specific upstream tag to sync (e.g. v3.0.34). Leave empty to read from UPSTREAM_VERSION.'
+        required: false
+        type: string
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+jobs:
+  # On pull_request: merge upstream tag into the PR branch so it's ready for review.
+  merge-upstream-into-pr:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+          fetch-tags: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Read upstream version
+        id: version
+        run: |
+          VERSION=$(grep -v '^#' UPSTREAM_VERSION | tr -d '[:space:]')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Upstream version: $VERSION"
+
+      - name: Fetch upstream tag
+        run: |
+          git remote add upstream https://github.com/ServiceStack/llms.git
+          git fetch upstream tag "${{ steps.version.outputs.version }}" --no-tags
+
+      - name: Attempt merge
+        id: merge
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git merge "$VERSION" \
+              --no-edit \
+              -m "Merge upstream $VERSION into obol main"; then
+            echo "status=clean" >> "$GITHUB_OUTPUT"
+          else
+            git merge --abort
+            echo "status=conflict" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push merged result
+        if: steps.merge.outputs.status == 'clean'
+        run: |
+          git push origin HEAD:${{ github.head_ref }}
+
+      - name: Comment on PR (clean merge)
+        if: steps.merge.outputs.status == 'clean'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          gh pr comment "${{ github.event.pull_request.number }}" \
+            --body "Upstream \`$VERSION\` merged cleanly into this branch. Ready for review.
+
+          After merging this PR, the workflow will automatically:
+          1. Create tag \`${VERSION}-obol.1\`
+          2. Trigger the multi-arch Docker build"
+
+      - name: Comment on PR (conflicts)
+        if: steps.merge.outputs.status == 'conflict'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          gh pr comment "${{ github.event.pull_request.number }}" \
+            --body "Upstream \`$VERSION\` has **merge conflicts**. Manual resolution required.
+
+          ### Steps to resolve
+          \`\`\`bash
+          git fetch upstream
+          git checkout ${{ github.head_ref }}
+          git merge $VERSION
+          # resolve conflicts
+          git add -A && git commit
+          git push
+          \`\`\`
+
+          ### Obol-specific files to preserve
+          - \`llms/extensions/smart_routing/\` (entire directory)
+          - \`llms/db.py\` bug fixes
+          - \`llms/main.py\` modifications
+          - \`llms/providers.json\` customizations
+          - \`.github/workflows/docker-publish.yml\`
+          - \`tests/test_smart_routing.py\`"
+
+          gh pr edit "${{ github.event.pull_request.number }}" --add-label "has-conflicts"
+
+  # On push to main (after PR merge): create obol tag and trigger Docker build.
+  tag-and-build:
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Determine version
+        id: version
+        run: |
+          if [[ -n "${{ inputs.upstream_tag }}" ]]; then
+            VERSION="${{ inputs.upstream_tag }}"
+          else
+            VERSION=$(grep -v '^#' UPSTREAM_VERSION | tr -d '[:space:]')
+          fi
+          OBOL_TAG="${VERSION}-obol.1"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "obol_tag=$OBOL_TAG" >> "$GITHUB_OUTPUT"
+          echo "Version: $VERSION -> $OBOL_TAG"
+
+      - name: Check if obol tag already exists
+        id: check
+        run: |
+          OBOL_TAG="${{ steps.version.outputs.obol_tag }}"
+          if git tag -l "$OBOL_TAG" | grep -q .; then
+            echo "Tag $OBOL_TAG already exists"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Merge upstream (workflow_dispatch only)
+        if: github.event_name == 'workflow_dispatch' && steps.check.outputs.exists != 'true'
+        id: merge
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+
+          git remote add upstream https://github.com/ServiceStack/llms.git
+          git fetch upstream tag "$VERSION" --no-tags
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git merge-base --is-ancestor "$VERSION" HEAD 2>/dev/null; then
+            echo "Already merged, only tag creation needed"
+            echo "status=already-merged" >> "$GITHUB_OUTPUT"
+          elif git merge "$VERSION" \
+              --no-edit \
+              -m "Merge upstream $VERSION into obol main"; then
+            git push origin main
+            echo "status=clean" >> "$GITHUB_OUTPUT"
+          else
+            git merge --abort
+            echo "::error::Merge conflicts with $VERSION. Use Renovate PR flow instead."
+            echo "status=conflict" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+      - name: Create and push obol tag
+        if: steps.check.outputs.exists != 'true'
+        run: |
+          OBOL_TAG="${{ steps.version.outputs.obol_tag }}"
+          git tag "$OBOL_TAG"
+          git push origin "$OBOL_TAG"
+          echo "Created and pushed $OBOL_TAG"
+
+      - name: Trigger Docker build
+        if: steps.check.outputs.exists != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          OBOL_TAG="${{ steps.version.outputs.obol_tag }}"
+          echo "Triggering docker-publish.yml at ref $OBOL_TAG"
+          gh workflow run docker-publish.yml --ref "$OBOL_TAG"
+
+      - name: Job summary
+        if: always()
+        run: |
+          OBOL_TAG="${{ steps.version.outputs.obol_tag }}"
+          if [[ "${{ steps.check.outputs.exists }}" == "true" ]]; then
+            echo "### Upstream Sync: No Action" >> "$GITHUB_STEP_SUMMARY"
+            echo "Tag \`$OBOL_TAG\` already exists." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### Upstream Sync: Success" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Merged: \`${{ steps.version.outputs.version }}\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Tag: \`$OBOL_TAG\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Docker build: triggered" >> "$GITHUB_STEP_SUMMARY"
+          fi

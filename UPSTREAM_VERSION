@@ -1,0 +1,3 @@
+# renovate: datasource=github-releases depName=ServiceStack/llms
+# Tracks the upstream llms version for fork sync.
+v3.0.33

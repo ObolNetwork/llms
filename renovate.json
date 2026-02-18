@@ -1,0 +1,49 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended"
+  ],
+  "enabledManagers": [
+    "custom.regex",
+    "github-actions"
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Track upstream ServiceStack/llms releases",
+      "matchStrings": [
+        "#\\s*renovate:\\s*datasource=(?<datasource>.*?)\\s+depName=(?<depName>.*?)\\n#[^\\n]*\\n(?<currentValue>v[0-9]+\\.[0-9]+\\.[0-9]+)"
+      ],
+      "fileMatch": [
+        "^UPSTREAM_VERSION$"
+      ],
+      "versioningTemplate": "semver"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "Upstream llms sync",
+      "matchDatasources": [
+        "github-releases"
+      ],
+      "matchPackageNames": [
+        "ServiceStack/llms"
+      ],
+      "labels": [
+        "upstream-sync"
+      ],
+      "schedule": [
+        "every hour"
+      ]
+    },
+    {
+      "matchManagers": [
+        "github-actions"
+      ],
+      "labels": [
+        "renovate/github-actions"
+      ],
+      "groupName": "GitHub Actions updates"
+    }
+  ]
+}
