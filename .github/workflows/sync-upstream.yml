@@ -195,7 +195,7 @@ jobs:
         run: |
           OBOL_TAG="${{ steps.version.outputs.obol_tag }}"
           echo "Triggering docker-publish.yml at ref $OBOL_TAG"
-          gh workflow run docker-publish.yml --ref "$OBOL_TAG"
+          gh workflow run docker-publish.yml --repo "${{ github.repository }}" --ref "$OBOL_TAG"
 
       - name: Job summary
         if: always()
