@@ -1366,6 +1366,9 @@ class OllamaProvider(OpenAiCompatible):
         super().__init__(**kwargs)
         # Ollama's OpenAI-compatible endpoint is at /v1/chat/completions
         self.chat_url = f"{self.api}/v1/chat/completions"
+        # Allow disabling server-side tool execution via providers.json
+        # When False, tool_calls pass through to the client untouched
+        self.tool_call_enabled = kwargs.get("tool_call", True)
 
     async def load(self):
         if not self.models:
@@ -1413,7 +1416,7 @@ class OllamaProvider(OpenAiCompatible):
                 "id": k,
                 "name": v.replace(":", " "),
                 "modalities": {"input": ["text"], "output": ["text"]},
-                "tool_call": True,
+                "tool_call": self.tool_call_enabled,
                 "cost": {
                     "input": 0,
                     "output": 0,
