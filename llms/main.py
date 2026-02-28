@@ -1059,11 +1059,8 @@ class GeneratorBase:
     def chat_summary(self, chat):
         return chat_summary(chat)
 
-    async def process_chat(self, chat, provider_id=None):
-        # remove tools from chat
-        clone = json.loads(json.dumps(chat))
-        clone.pop("tools", None)
-        return await process_chat(clone, provider_id)
+    def process_chat(self, chat, provider_id=None):
+        return process_chat(chat, provider_id)
 
     async def response_json(self, response):
         return await response_json(response)
@@ -4259,6 +4256,12 @@ def cli_exec(cli_args, extra_args):
                     )
                     await sse_response.prepare(request)
                     for choice in response.get("choices", []):
+                        message = choice.get("message", {})
+                        delta = {"role": "assistant", "content": message.get("content", "")}
+                        # Preserve tool_calls so clients that execute tools client-side
+                        # (e.g. OpenClaw with tool_call=false) can see them.
+                        if "tool_calls" in message:
+                            delta["tool_calls"] = message["tool_calls"]
                         chunk = {
                             "id": response.get("id", ""),
                             "object": "chat.completion.chunk",
@@ -4266,7 +4269,7 @@ def cli_exec(cli_args, extra_args):
                             "model": response.get("model", ""),
                             "choices": [{
                                 "index": choice.get("index", 0),
-                                "delta": {"role": "assistant", "content": choice.get("message", {}).get("content", "")},
+                                "delta": delta,
                                 "finish_reason": choice.get("finish_reason"),
                             }],
                             "usage": response.get("usage"),
